@@ -74,7 +74,7 @@ class MiniMindConfig(PretrainedConfig):
         self.norm_topk_prob = norm_topk_prob  # 是否标准化top-k概率
 
 
-from typing import Optional
+from typing import Optional,Tuple
 import torch
 import torch.nn as nn
 import math
@@ -99,7 +99,8 @@ class RMSNorm(nn.Module):
 # 实现yarn
 def precomput_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6, rope_scaling: Optional[dict] = None):
     # rope最初给出的频率
-    freqs = 1.0 / (rope_base ** torch.arange(0, dim, 2).float() / dim)
+    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2).float() / dim))
+    # factor即外推比例，即外推长度/预训练窗口长度
     if rope_scaling is not None:
         orig_max, factor, beta_fast,beta_slow = (
             rope_scaling.get("original_max_position_embeddings", 2048),
@@ -108,21 +109,23 @@ def precomput_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 
             rope_scaling.get("beta_slow", 1.0),
         )
 
-        # 计算线性插值与非线性插值的临界点
-        corr_dim = next((i for i in range(dim // 2) if 2 * math.pi / freqs[i] > orig_max), dim // 2)
+        # 仅当外推比例大于1时，才进行缩放
+        if end / orig_max > 1.0:
+            # 计算线性插值与非线性插值的临界点
+            corr_dim = next((i for i in range(dim // 2) if 2 * math.pi / freqs[i] > orig_max), dim // 2)
 
-        # 计算beta
-        power = torch.arange(0, dim // 2, device = freqs.device).float() / (max(dim // 2 - 1, 1))
-        beta = beta_slow + (beta_fast - beta_slow) * power
+            # 计算beta
+            power = torch.arange(0, dim // 2, device = freqs.device).float() / (max(dim // 2 - 1, 1))
+            beta = beta_slow + (beta_fast - beta_slow) * power
 
-        #计算scale
-        scale = torch.where(torch.arange(0, dim // 2, device = freqs.device) < corr_dim,
-                            (beta * factor - beta + 1.0) / (factor * beta),
-                            1.0 / factor
-                            )
-        
-        # 应用scale缩放
-        freqs = freqs * scale
+            #计算scale
+            scale = torch.where(torch.arange(0, dim // 2, device = freqs.device) < corr_dim,
+                                (beta * factor - beta + 1.0) / (factor * beta),
+                                1.0 / factor
+                                )
+            
+            # 应用scale缩放
+            freqs = freqs * scale
 
     # 生成位置索引
     t = torch.arange(end, device=freqs.device)
@@ -146,7 +149,88 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim: int = 1):
         return torch.cat((-x2, x1), dim=-1)
     
     # 应用旋转位置编码
+    # 这个unsqueeze_dim是为了后续适配q和k的形状
+    # cos和sin的形状是[seq_len, dim],而q和k的形状是[batch_size, seq_len, num_heads, head_dim]
+    # 在dim=1处增加一个维度后，cos和sin的形状变为[seq_len, 1, dim]，这样就可以和q、k进行广播运算
     q_rotated = q * cos.unsqueeze(unsqueeze_dim) + rotate_half(q) * sin.unsqueeze(unsqueeze_dim)
     k_rotated = k * cos.unsqueeze(unsqueeze_dim) + rotate_half(k) * sin.unsqueeze(unsqueeze_dim)
 
     return q_rotated, k_rotated
+
+# 多个Q共享一个KV，因此需要实现repeat_kv
+def repeat_kv(x: torch.Tensor, n_rep: int):
+    # x,即key或value
+    # x的形状是[batch_size, seq_len, num_key_value_heads, head_dim]
+    # 其中，num_key_value_heads是num_attention_heads的1/4
+    # 重复num_key_value_heads维度n_rep次
+    return x.repeat_interleave(n_rep, dim=2)
+
+# 注意力层
+class MiniMindAttention(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        if config.num_key_value_heads is not None:
+            self.num_key_value_heads = config.num_key_value_heads
+        else:
+            # 如果没有配置num_key_value_heads，则默认为num_attention_heads，即一个Q一个KV
+            self.num_key_value_heads = config.num_attention_heads
+
+        # 确保num_attention_heads可以被num_key_value_heads整除
+        assert config.num_attention_heads % self.num_key_value_heads == 0, "num_attention_heads must be divisible by num_key_value_heads"
+        # 确保hidden_size可以被num_attention_heads整除
+        assert config.hidden_size % config.num_attention_heads == 0, "hidden_size must be divisible by num_attention_heads"
+
+        self.n_local_heads = config.num_attention_heads
+        self.n_rep = config.num_attention_heads // self.num_key_value_heads
+        self.head_dim = config.hidden_size // config.num_attention_heads
+
+        # wq, wk, wv, wo
+        self.q_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+
+        # 注意力dropout
+        self.attn_dropout = nn.Dropout(config.dropout)
+
+        # 这里还没学，先抄上
+        self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention") and config.flash_attn
+
+    #forward
+    def forward(self, x: torch.Tensor, 
+                position_embeddings: Tuple[torch.Tensor, torch.Tensor], 
+                attn_mask: Optional[torch.Tensor] = None,
+                past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                use_cache: bool = False
+                ) -> torch.Tensor:
+        # 计算 q, k, v
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        # 把q, k, v 拆成多个头
+        batch_size, seq_len, _ = x.shape
+        q = q.view(batch_size, seq_len, self.n_local_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+        
+        # 对q和k应用旋转位置编码
+        cos, sin = position_embeddings
+        q, k = apply_rotary_pos_emb(q, k, cos[:seq_len], sin[:seq_len]) #只需使用前seq_len个位置的编码？？？,如果用kv_cache的话，这里会不会有问题？？？
+
+        # kv_cache处理
+        if past_kv is not None:
+            # 如果有past_kv，则将其与当前的k和v拼接
+            past_k, past_v = past_kv
+            k = torch.cat([past_k, k], dim=1)
+            v = torch.cat([past_v, v], dim=1)
+        past_kv = (k, v) if use_cache else None
+
+        # 对k和v应用repeat_kv
+        k = repeat_kv(k, self.n_rep)
+        v = repeat_kv(v, self.n_rep)
+        # 计算注意力得分
+        # 先作转置
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # [batch_size, num_heads, seq_len, head_dim]
+        # 拼接头，经过out_proj输出
+
