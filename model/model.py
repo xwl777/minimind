@@ -77,6 +77,7 @@ class MiniMindConfig(PretrainedConfig):
 from typing import Optional,Tuple
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 
 #RMSnorm implementation
@@ -192,7 +193,8 @@ class MiniMindAttention(nn.Module):
 
         # 注意力dropout
         self.attn_dropout = nn.Dropout(config.dropout)
-
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.dropout = config.dropout
         # 这里还没学，先抄上
         self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention") and config.flash_attn
 
@@ -202,7 +204,7 @@ class MiniMindAttention(nn.Module):
                 attn_mask: Optional[torch.Tensor] = None,
                 past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 use_cache: bool = False
-                ) -> torch.Tensor:
+                ):
         # 计算 q, k, v
         q = self.q_proj(x)
         k = self.k_proj(x)
@@ -213,10 +215,32 @@ class MiniMindAttention(nn.Module):
         q = q.view(batch_size, seq_len, self.n_local_heads, self.head_dim)
         k = k.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
         v = v.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+
+        # 找到应用旋转位置编码的位置id
+        if past_kv is not None:
+            # 如果有past_kv，则将其与当前的k和v拼接
+           cache_len = past_kv[0].shape[1]
+           total_len = cache_len + seq_len
+           pos_id = torch.arange(cache_len, total_len, device=x.device).unsqueeze(0)
+        else:
+            total_len = seq_len
+            pos_id = torch.arange(total_len, device=x.device).unsqueeze(0)
         
         # 对q和k应用旋转位置编码
         cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb(q, k, cos[:seq_len], sin[:seq_len]) #只需使用前seq_len个位置的编码？？？,如果用kv_cache的话，这里会不会有问题？？？
+        q, k = apply_rotary_pos_emb(q, k, cos[pos_id], sin[pos_id])
+
+        # 原minimind实现
+        # cos, sin = position_embeddings
+        # xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
+
+        # # kv_cache实现
+        # if past_key_value is not None:
+        #     xk = torch.cat([past_key_value[0], xk], dim=1)
+        #     xv = torch.cat([past_key_value[1], xv], dim=1)
+        # past_kv = (xk, xv) if use_cache else None
+
+        # 我认为这里的kv_cache和旋转位置编码冲突
 
         # kv_cache处理
         if past_kv is not None:
@@ -232,5 +256,27 @@ class MiniMindAttention(nn.Module):
         # 计算注意力得分
         # 先作转置
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # [batch_size, num_heads, seq_len, head_dim]
+
+        #如果使用flash attention
+        # 为何是torch.all(attn_mask == 1) ？
+        if self.flash and total_len > 1 and (attn_mask is None or torch.all(attn_mask == 1)):
+            output = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=self.attn_dropout.p if self.training else 0.0, is_causal=True
+            )
+        else:
+            scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            scores = scores + torch.triu(torch.full((total_len, total_len), float('-inf'), diagonal = 1, device = scores.device)).unsqueeze(0).unsqueeze(0)
+            if attn_mask is not None:
+                extended_attn_mask = attn_mask.unsqueeze(1).unsqueeze(2)  # [1, 1, seq_len, seq_len]
+                extended_attn_mask = (1 - extended_attn_mask) * (-1e9)
+                scores = scores + extended_attn_mask
+            attn_weights = torch.softmax(scores.float(), dim=-1).type_as(q)
+            attn_weights = self.attn_dropout(attn_weights)
+            output = attn_weights @ v
+
         # 拼接头，经过out_proj输出
+        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        output = self.resid_dropout(self.out_proj(output))
+        return output, past_kv
+
 
