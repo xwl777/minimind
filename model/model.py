@@ -1,5 +1,10 @@
 from transformers import PretrainedConfig
-
+from transformers.activations import ACT2FN
+from typing import Optional,Tuple
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
 
 class MiniMindConfig(PretrainedConfig):
     model_type = "minimind"
@@ -74,11 +79,7 @@ class MiniMindConfig(PretrainedConfig):
         self.norm_topk_prob = norm_topk_prob  # 是否标准化top-k概率
 
 
-from typing import Optional,Tuple
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
+
 
 #RMSnorm implementation
 class RMSNorm(nn.Module):
@@ -166,7 +167,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int):
     # 重复num_key_value_heads维度n_rep次
     return x.repeat_interleave(n_rep, dim=2)
 
-# 注意力层
+# 注意力层（GQA）
 class MiniMindAttention(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
@@ -216,31 +217,9 @@ class MiniMindAttention(nn.Module):
         k = k.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
         v = v.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
 
-        # 找到应用旋转位置编码的位置id
-        if past_kv is not None:
-            # 如果有past_kv，则将其与当前的k和v拼接
-           cache_len = past_kv[0].shape[1]
-           total_len = cache_len + seq_len
-           pos_id = torch.arange(cache_len, total_len, device=x.device).unsqueeze(0)
-        else:
-            total_len = seq_len
-            pos_id = torch.arange(total_len, device=x.device).unsqueeze(0)
-        
-        # 对q和k应用旋转位置编码
+        # 这里没有问题。minimind中这类传入的cos和sin已经是在past_position处截断的
         cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb(q, k, cos[pos_id], sin[pos_id])
-
-        # 原minimind实现
-        # cos, sin = position_embeddings
-        # xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
-
-        # # kv_cache实现
-        # if past_key_value is not None:
-        #     xk = torch.cat([past_key_value[0], xk], dim=1)
-        #     xv = torch.cat([past_key_value[1], xv], dim=1)
-        # past_kv = (xk, xv) if use_cache else None
-
-        # 我认为这里的kv_cache和旋转位置编码冲突
+        q, k = apply_rotary_pos_emb(q, k, cos[:seq_len], sin[:seq_len])
 
         # kv_cache处理
         if past_kv is not None:
@@ -259,14 +238,16 @@ class MiniMindAttention(nn.Module):
 
         #如果使用flash attention
         # 为何是torch.all(attn_mask == 1) ？
-        if self.flash and total_len > 1 and (attn_mask is None or torch.all(attn_mask == 1)):
+        if self.flash and seq_len > 1 and (attn_mask is None or torch.all(attn_mask == 1)):
             output = F.scaled_dot_product_attention(
                 q, k, v, dropout_p=self.attn_dropout.p if self.training else 0.0, is_causal=True
             )
         else:
             scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            scores = scores + torch.triu(torch.full((total_len, total_len), float('-inf'), diagonal = 1, device = scores.device)).unsqueeze(0).unsqueeze(0)
+            scores = scores + torch.triu(torch.full((seq_len, seq_len), float('-inf'), diagonal = 1, device = scores.device)).unsqueeze(0).unsqueeze(0)
             if attn_mask is not None:
+                # 首先，根据注释可以进一步确认用户输入的 attention_mask 应该是一个 (batch, length) 的二维 tensor, 
+                # 其中只包括 0 和 1 ； 此外 attention_mask 会被展开成形状为 (batch, 1, 1, length) 的四维矩阵；
                 extended_attn_mask = attn_mask.unsqueeze(1).unsqueeze(2)  # [1, 1, seq_len, seq_len]
                 extended_attn_mask = (1 - extended_attn_mask) * (-1e9)
                 scores = scores + extended_attn_mask
@@ -275,8 +256,71 @@ class MiniMindAttention(nn.Module):
             output = attn_weights @ v
 
         # 拼接头，经过out_proj输出
-        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        output = output.transpose(1, 2).reshape(batch_size, seq_len, -1)
+        # 残差dropout，但是残差这里还没加上应该
         output = self.resid_dropout(self.out_proj(output))
         return output, past_kv
+    
+
+#实现FFN
+class FeedForward(nn.Module):
+    # init
+    # 升维全连接层
+    # SiLU激活函数
+    # 降维全连接层
+    # 门控
+    # dropout
+    
+    def __init__(self,config: MiniMindConfig):
+        super().__init__()
+        if config.intermediate_size is None:
+            intermediate_size = (config.hidden_size * 8) // 3
+            config.intermediate_size = ((intermediate_size + 64 - 1) // 64) * 64
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.__init__
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.dropout = nn.Dropout(config.dropout)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    # forward
+    def forward(self, x: torch.Tensor):
+        return self.dropout(self.down_proj(self.up_proj(x) * self.act_fn(self.gate_proj(x))))
+    
+
+#将GQA和FFN结合成一个Transformer块
+class MiniMindBlock(nn.Module):
+    def __init__(self, layer_id: int, config: MiniMindConfig):
+        super().__init__()
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.layer_id = layer_id
+
+        self.attn = MiniMindAttention(config)
+        self.ffn = FeedForward(config)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    #forward
+    def forward(self,hidden_states: torch.Tensor,
+                position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+                attn_mask: Optional[torch.Tensor] = None,
+                past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                use_cache: bool = False
+                ):
+        residue = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        attn_output, present_kv = self.attn(
+            hidden_states,
+            position_embeddings,
+            attn_mask,
+            past_kv,
+            use_cache
+        )
+        hidden_states = residue + attn_output
+        hidden_states = hidden_states + self.ffn(self.post_attention_layernorm(hidden_states))
+        return hidden_states, present_kv
 
 
