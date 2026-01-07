@@ -1,12 +1,14 @@
 from transformers import PretrainedConfig
+from transformers import PreTrainedModel, GenerationMixin
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.activations import ACT2FN
-from typing import Optional,Tuple
+from typing import Optional,Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-class MiniMindConfig(PretrainedConfig):
+class SGMindConfig(PretrainedConfig):
     model_type = "minimind"
 
     def __init__(
@@ -168,8 +170,8 @@ def repeat_kv(x: torch.Tensor, n_rep: int):
     return x.repeat_interleave(n_rep, dim=2)
 
 # 注意力层（GQA）
-class MiniMindAttention(nn.Module):
-    def __init__(self, config: MiniMindConfig):
+class SGMindAttention(nn.Module):
+    def __init__(self, config: SGMindConfig):
         super().__init__()
         if config.num_key_value_heads is not None:
             self.num_key_value_heads = config.num_key_value_heads
@@ -270,8 +272,8 @@ class FeedForward(nn.Module):
     # 降维全连接层
     # 门控
     # dropout
-    
-    def __init__(self,config: MiniMindConfig):
+
+    def __init__(self,config: SGMindConfig):
         super().__init__()
         if config.intermediate_size is None:
             intermediate_size = (config.hidden_size * 8) // 3
@@ -289,15 +291,15 @@ class FeedForward(nn.Module):
     
 
 #将GQA和FFN结合成一个Transformer块
-class MiniMindBlock(nn.Module):
-    def __init__(self, layer_id: int, config: MiniMindConfig):
+class LWXMindBlock(nn.Module):
+    def __init__(self, layer_id: int, config: SGMindConfig):
         super().__init__()
         self.num_attention_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.layer_id = layer_id
 
-        self.attn = MiniMindAttention(config)
+        self.attn = SGMindAttention(config)
         self.ffn = FeedForward(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -322,5 +324,110 @@ class MiniMindBlock(nn.Module):
         hidden_states = residue + attn_output
         hidden_states = hidden_states + self.ffn(self.post_attention_layernorm(hidden_states))
         return hidden_states, present_kv
+    
+class LWXMindModel(nn.Module):
+    def __init__(self, config: SGMindConfig):
+        super().__init__()
+        # 词表大小
+        self.vocab_size = config.vocab_size
+        # block_layers
+        self.num_hidden_layers = config.num_hidden_layers
+        # embedding层
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        # dropout层 架构图里似乎没画
+        self.dropout = nn.Dropout(config.dropout)
+        # transformer blocks, i是block的层数，从0开始
+        self.blocks = nn.ModuleList([LWXMindBlock(i, config) for i in range(config.num_hidden_layers)])
+        # 最后的RMSNorm层
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # 预计算位置编码的cos和sin
+        freqs_cos, freqs_sin = precomput_freqs_cis(
+            dim = config.hidden_size // config.num_attention_heads,
+            end = config.max_position_embeddings,
+            rope_base = config.rope_theta,
+            rope_scaling = config.rope_scaling
+        )
 
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
+    # forward
+    def forward(self, input_ids: torch.Tensor,
+                attention_mask: Optional[torch.Tensor] = None,
+                past_key_values: Optional[list[Tuple[torch.Tensor, torch.Tensor]]] = None,
+                use_cache: bool = False,
+                **kwargs
+                ):
+        # 解包形状
+        batch_size, seq_len = input_ids.shape
+
+        # 防止传入huggingface中封装好的某些对象，而这些对象可能有layers属性，但minimind没有实现相应的处理，干脆直接扔掉
+        if hasattr(past_key_values, 'layers'):
+            past_key_values = None
+        past_key_values = past_key_values or [None] * self.num_hidden_layers    
+
+        # 计算start_position,用于后续位置编码
+        start_position = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+
+        position_embeddings = (
+            self.freqs_cos[start_position: start_position + seq_len, :],
+            self.freqs_sin[start_position: start_position + seq_len, :]
+        )
+
+        presents = []
+        hidden_states = self.embed_tokens(input_ids)
+        hidden_states = self.dropout(hidden_states)
+
+        for layer_idx, (block, past_kv) in enumerate(zip(self.blocks, past_key_values)):
+            hidden_states, present_kv = block(
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                past_kv,
+                use_cache
+            )
+            presents.append(present_kv)
+
+            #aux_loss计算暂时不实现(因为没有MOE模块)
+            # aux_loss = sum(block.mlp.aux_loss for block in self.blocks if isinstance(block.mlp, MOEFeedForward))
+        aux_loss = 0
+
+        hidden_states = self.norm(hidden_states)
+        
+        return hidden_states, presents, aux_loss
+
+class LWXMindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = SGMindConfig
+
+    def __init__(self, config: SGMindConfig):
+        self.config = config or SGMindConfig()
+        super().__init__(self.config)
+        self.model = LWXMindModel(self.config)
+        # 输出linear层
+        self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        # 权重共享.embed矩阵是一个参数巨大的矩阵，这么做可以节省显存
+        self.model.embed_tokens.weight = self.lm_head.weight
+
+    def forward(self,input_ids: torch.Tensor,
+                attention_mask: Optional[torch.Tensor] = None,
+                past_key_values: Optional[list[Tuple[torch.Tensor, torch.Tensor]]] = None,
+                use_cache: bool = False,
+                logits_to_keep: Union[int, torch.Tensor] = 0,
+                **kwargs
+                ):
+        hidden_states, presents, aux_loss = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache
+        )
+
+        # 在prefill阶段节省计算，只计算最后logits_to_keep个token的logits
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) and logits_to_keep > 0 else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        
+        output = CausalLMOutputWithPast(logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
+        output.aux_loss = aux_loss
+        return output
+
+        
