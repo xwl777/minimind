@@ -14,11 +14,19 @@ random.seed(42)
 
 def train_tokenizer():
     # 读取JSONL文件并提取文本数据
-    def read_texts_from_jsonl(file_path):
-        with open(file_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                data = json.loads(line)
-                yield data['text']
+    def batch_iterator(data_path):
+        MAX_LINES = 500000
+        with open(data_path, "r", encoding="utf-8") as f:
+            for i, line in enumerate(f, start=1):
+                if i >= MAX_LINES:
+                    break
+                try:
+                    data = json.loads(line)
+                    text = data.get("text", "")
+                    if text: # 确保文本不为空
+                        yield text
+                except:
+                    continue # 跳过坏数据
 
     data_path = '../dataset/pretrain_hq.jsonl'
 
@@ -34,14 +42,17 @@ def train_tokenizer():
         vocab_size=6400,
         special_tokens=special_tokens,  # 确保这三个token被包含
         show_progress=True,
-        initial_alphabet=pre_tokenizers.ByteLevel.alphabet()
+        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+        continuing_subword_prefix="",  # 减少内存占用
+        end_of_word_suffix="",         # 减少内存占用
+        limit_alphabet=1000,          # 限制初始字母表大小
     )
 
     # 读取文本数据
-    texts = read_texts_from_jsonl(data_path)
+    #texts = read_texts_from_jsonl(data_path)
 
     # 训练tokenizer
-    tokenizer.train_from_iterator(texts, trainer=trainer)
+    tokenizer.train_from_iterator(batch_iterator(data_path=data_path), trainer=trainer)
 
     # 设置解码器
     tokenizer.decoder = decoders.ByteLevel()

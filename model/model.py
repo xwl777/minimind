@@ -94,7 +94,7 @@ class RMSNorm(nn.Module):
 
     # _norm
     def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepDim=True) + self.eps)
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
     
     # forward
     def forward(self, x):
@@ -424,7 +424,7 @@ class SGMindForCausalLM(PreTrainedModel, GenerationMixin):
         )
 
         # 在prefill阶段节省计算，只计算最后logits_to_keep个token的logits
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) and logits_to_keep > 0 else logits_to_keep
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         output = CausalLMOutputWithPast(logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)

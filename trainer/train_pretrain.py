@@ -32,7 +32,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             param_group['lr'] = lr
 
         with autocast_ctx:
-            res = model(X)
+            res = model(X, logits_to_keep=0)
             loss = loss_fct(
                 res.logits.view(-1, res.logits.size(-1)),
                 Y.view(-1)
