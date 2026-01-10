@@ -292,7 +292,7 @@ class FeedForward(nn.Module):
     
 
 #将GQA和FFN结合成一个Transformer块
-class LWXMindBlock(nn.Module):
+class SGMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: SGMindConfig):
         super().__init__()
         self.num_attention_heads = config.num_attention_heads
@@ -325,8 +325,8 @@ class LWXMindBlock(nn.Module):
         hidden_states = residue + attn_output
         hidden_states = hidden_states + self.ffn(self.post_attention_layernorm(hidden_states))
         return hidden_states, present_kv
-    
-class LWXMindModel(nn.Module):
+
+class SGMindModel(nn.Module):
     def __init__(self, config: SGMindConfig):
         super().__init__()
         # 词表大小
@@ -338,7 +338,7 @@ class LWXMindModel(nn.Module):
         # dropout层 架构图里似乎没画
         self.dropout = nn.Dropout(config.dropout)
         # transformer blocks, i是block的层数，从0开始
-        self.blocks = nn.ModuleList([LWXMindBlock(i, config) for i in range(config.num_hidden_layers)])
+        self.blocks = nn.ModuleList([SGMindBlock(i, config) for i in range(config.num_hidden_layers)])
         # 最后的RMSNorm层
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # 预计算位置编码的cos和sin
@@ -397,13 +397,13 @@ class LWXMindModel(nn.Module):
         
         return hidden_states, presents, aux_loss
 
-class LWXMindForCausalLM(PreTrainedModel, GenerationMixin):
+class SGMindForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = SGMindConfig
 
     def __init__(self, config: SGMindConfig):
         self.config = config or SGMindConfig()
         super().__init__(self.config)
-        self.model = LWXMindModel(self.config)
+        self.model = SGMindModel(self.config)
         # 输出linear层
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         # 权重共享.embed矩阵是一个参数巨大的矩阵，这么做可以节省显存
