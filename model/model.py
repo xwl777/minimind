@@ -122,7 +122,8 @@ def precomput_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 
             power = torch.arange(0, dim // 2, device = freqs.device).float() / (max(dim // 2 - 1, 1))
             beta = beta_slow + (beta_fast - beta_slow) * power
 
-            #计算scale
+            # 计算scale
+            # 高频非线性插值，低频线性插值
             scale = torch.where(torch.arange(0, dim // 2, device = freqs.device) < corr_dim,
                                 (beta * factor - beta + 1.0) / (factor * beta),
                                 1.0 / factor
@@ -425,7 +426,7 @@ class LWXMindForCausalLM(PreTrainedModel, GenerationMixin):
         # 在prefill阶段节省计算，只计算最后logits_to_keep个token的logits
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) and logits_to_keep > 0 else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
-        
+
         output = CausalLMOutputWithPast(logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
         output.aux_loss = aux_loss
         return output
