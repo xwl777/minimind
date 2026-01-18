@@ -233,12 +233,18 @@ class SGMindAttention(nn.Module):
         past_kv = (k, v) if use_cache else None
 
         # 对k和v应用repeat_kv
+
         k = repeat_kv(k, self.n_rep)
         v = repeat_kv(v, self.n_rep)
         # 计算注意力得分
         # 先作转置
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # [batch_size, num_heads, seq_len, head_dim]
-
+        # print("q shape:")
+        # print(q.shape)
+        # print("k shape:")
+        # print(k.shape)
+        # print("v shape:")
+        # print(v.shape)
         #如果使用flash attention
         # 为何是torch.all(attn_mask == 1) ？
         if self.flash and seq_len > 1 and (attn_mask is None or torch.all(attn_mask == 1)):
@@ -247,15 +253,27 @@ class SGMindAttention(nn.Module):
             )
         else:
             scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            scores = scores + torch.triu(torch.full((seq_len, seq_len), float('-inf'), diagonal = 1, device = scores.device)).unsqueeze(0).unsqueeze(0)
+          #  print("scores shape:")
+            #print(scores.shape)
+            scores = scores + torch.triu(torch.full((seq_len, seq_len), float('-inf'), device = scores.device), diagonal = 1).unsqueeze(0).unsqueeze(0)
+            # print("scores after adding causal mask shape:")
+            # print(scores.shape)
+            # print("attn_mask:")
+            # print(attn_mask)
             if attn_mask is not None:
                 # 首先，根据注释可以进一步确认用户输入的 attention_mask 应该是一个 (batch, length) 的二维 tensor, 
                 # 其中只包括 0 和 1 ； 此外 attention_mask 会被展开成形状为 (batch, 1, 1, length) 的四维矩阵；
                 extended_attn_mask = attn_mask.unsqueeze(1).unsqueeze(2)  # [1, 1, seq_len, seq_len]
                 extended_attn_mask = (1 - extended_attn_mask) * (-1e9)
                 scores = scores + extended_attn_mask
+                # print("scores after adding attn_mask shape:")
+                # print(scores.shape)
             attn_weights = torch.softmax(scores.float(), dim=-1).type_as(q)
             attn_weights = self.attn_dropout(attn_weights)
+            # print("attn_weights shape:")
+            # print(attn_weights.shape)
+            # print("v shape:")
+            # print(v.shape)
             output = attn_weights @ v
 
         # 拼接头，经过out_proj输出
@@ -359,13 +377,17 @@ class SGMindModel(nn.Module):
                 use_cache: bool = False,
                 **kwargs
                 ):
+        
+        
         # 解包形状
         batch_size, seq_len = input_ids.shape
 
         # 防止传入huggingface中封装好的某些对象，而这些对象可能有layers属性，但minimind没有实现相应的处理，干脆直接扔掉
         if hasattr(past_key_values, 'layers'):
             past_key_values = None
-        past_key_values = past_key_values or [None] * self.num_hidden_layers    
+         
+        past_key_values = past_key_values or [None] * self.num_hidden_layers   
+
 
         # 计算start_position,用于后续位置编码
         start_position = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
@@ -392,6 +414,9 @@ class SGMindModel(nn.Module):
             #aux_loss计算暂时不实现(因为没有MOE模块)
             # aux_loss = sum(block.mlp.aux_loss for block in self.blocks if isinstance(block.mlp, MOEFeedForward))
         aux_loss = 0
+        # print("kv cache shape:")
+        # print(len(presents))
+        # print(presents[0][0].shape)
 
         hidden_states = self.norm(hidden_states)
         
@@ -427,7 +452,7 @@ class SGMindForCausalLM(PreTrainedModel, GenerationMixin):
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
-        output = CausalLMOutputWithPast(logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
+        output = CausalLMOutputWithPast(logits=logits, past_key_values=presents, hidden_states=hidden_states)
         output.aux_loss = aux_loss
         return output
 
