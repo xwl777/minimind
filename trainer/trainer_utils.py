@@ -21,9 +21,12 @@ def Logger(content):
     if is_main_process():
         print(content)
 
-
+# get_lr 加入warmup
 def get_lr(current_step, total_steps, lr):
-    return lr*(0.1 + 0.45*(1 + math.cos(math.pi * current_step / total_steps)))
+    warmup_steps = math.min(2000, total_steps // 20)
+    if current_step < warmup_steps:
+        return lr * current_step / warmup_steps
+    return lr*(0.1 + 0.45*(1 + math.cos(math.pi * (current_step - warmup_steps) / (total_steps - warmup_steps))))
 
 
 def init_distributed_mode():
