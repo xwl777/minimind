@@ -1,6 +1,5 @@
 # function of different module
 ### author:xwl777
-### update time:2025/12/25 | 2025/12/28 | 2025/12/30 | 2026/1/7
 ### last update:2026/1/7
 ---
 ![alt text](structure.png)
