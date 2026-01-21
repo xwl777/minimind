@@ -239,41 +239,26 @@ class SGMindAttention(nn.Module):
         # 计算注意力得分
         # 先作转置
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # [batch_size, num_heads, seq_len, head_dim]
-        # print("q shape:")
-        # print(q.shape)
-        # print("k shape:")
-        # print(k.shape)
-        # print("v shape:")
-        # print(v.shape)
+       
         #如果使用flash attention
-        # 为何是torch.all(attn_mask == 1) ？
         if self.flash and seq_len > 1 and (attn_mask is None or torch.all(attn_mask == 1)):
             output = F.scaled_dot_product_attention(
                 q, k, v, dropout_p=self.attn_dropout.p if self.training else 0.0, is_causal=True
             )
         else:
             scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-          #  print("scores shape:")
-            #print(scores.shape)
             scores = scores + torch.triu(torch.full((seq_len, seq_len), float('-inf'), device = scores.device), diagonal = 1).unsqueeze(0).unsqueeze(0)
-            # print("scores after adding causal mask shape:")
-            # print(scores.shape)
-            # print("attn_mask:")
-            # print(attn_mask)
+          
             if attn_mask is not None:
                 # 首先，根据注释可以进一步确认用户输入的 attention_mask 应该是一个 (batch, length) 的二维 tensor, 
                 # 其中只包括 0 和 1 ； 此外 attention_mask 会被展开成形状为 (batch, 1, 1, length) 的四维矩阵；
                 extended_attn_mask = attn_mask.unsqueeze(1).unsqueeze(2)  # [1, 1, seq_len, seq_len]
                 extended_attn_mask = (1 - extended_attn_mask) * (-1e9)
                 scores = scores + extended_attn_mask
-                # print("scores after adding attn_mask shape:")
-                # print(scores.shape)
+               
             attn_weights = torch.softmax(scores.float(), dim=-1).type_as(q)
             attn_weights = self.attn_dropout(attn_weights)
-            # print("attn_weights shape:")
-            # print(attn_weights.shape)
-            # print("v shape:")
-            # print(v.shape)
+           
             output = attn_weights @ v
 
         # 拼接头，经过out_proj输出
@@ -414,9 +399,7 @@ class SGMindModel(nn.Module):
             #aux_loss计算暂时不实现(因为没有MOE模块)
             # aux_loss = sum(block.mlp.aux_loss for block in self.blocks if isinstance(block.mlp, MOEFeedForward))
         aux_loss = 0
-        # print("kv cache shape:")
-        # print(len(presents))
-        # print(presents[0][0].shape)
+       
 
         hidden_states = self.norm(hidden_states)
         

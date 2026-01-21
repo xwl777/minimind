@@ -1,8 +1,18 @@
 # function of dataset
 ### author:xwl777
-### last update:2026/1/12
+### last update:2026/1/20
 ---
-
+![alt text](dataset.png)
+./dataset/  
+├── dpo.jsonl (55MB)  
+├── lora_identity.jsonl (22.8KB)  
+├── lora_medical.jsonl (34MB)  
+├── pretrain_hq.jsonl (1.6GB, ✨)  
+├── r1_mix_1024.jsonl (340MB)  
+├── sft_1024.jsonl (5.6GB)  
+├── sft_2048.jsonl (9GB)  
+├── sft_512.jsonl (7.5GB)  
+└── sft_mini_512.jsonl (1.2GB, ✨)
 1. **jsonl**  
    *  jsonl格式每一行都是一个json对象，因此可以很方便的用python迭代器一次读取一个json对象。用```json.loads()```方法可以把json对象转化为一个字典如{"text": "..."}。
 
