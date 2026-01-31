@@ -73,5 +73,6 @@
         logits = self.lm_head(hidden_states[:, slice_indices, :])
      ```
      在train阶段，不应该进行slice。在predict阶段中，在prefill阶段，slice可以减少计算量；在decoding阶段，因为本来传入的hidden_states的seq_len就是1，slice无影响。
+
      
   

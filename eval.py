@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from model.model import SGMindConfig, SGMindForCausalLM
-# from model.model_lora import *
+from model.model_lora import load_lora, apply_lora
 from trainer.trainer_utils import setup_seed
 warnings.filterwarnings('ignore')
 
@@ -71,8 +71,10 @@ def main():
 
         templates = {"conversation": conversation, "tokenize": False, "add_generation_prompt": True}
         if args.weight == 'reason': templates["enable_thinking"] = True # 仅Reason模型使用
-        inputs = tokenizer.apply_chat_template(**templates) if args.weight != 'pretrain' else (tokenizer.bos_token + prompt)
-        inputs = tokenizer(inputs, return_tensors="pt", truncation=True).to(args.device)
+        prompt_str = tokenizer.apply_chat_template(**templates) if args.weight != 'pretrain' else (tokenizer.bos_token + prompt)
+
+        # print(f"DEBUG: prompt_str type: {type(prompt_str)}")
+        inputs = tokenizer(prompt_str, return_tensors="pt", truncation=True).to(args.device)
 
         print('🤖️: ', end='')
         generated_ids = model.generate(

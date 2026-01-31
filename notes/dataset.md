@@ -1,6 +1,6 @@
 # function of dataset
 ### author:xwl777
-### last update:2026/1/20
+### last update:2026/1/31
 ---
 ![alt text](dataset.png)
 ./dataset/  
@@ -19,3 +19,17 @@
 2. **Dataset类**
    * 继承Dataset类的子类必须实现```__len__（）```和```__getitem__（index）```两个方法。```__len__（）```返回数据集的大小，```__getitem__（index）```根据索引从数据集中取出对象。
    * minimind的```__getitem__（index）```方法返回一个三元组（X,Y,loss_mask）。假设一个句子seq由n个token组成，X为seq[:-1],Y为seq[1：]。loss_mask是一个损失掩码，因为对于长度未达到max_length的句子我们会填充PAD字符，同时不希望PAD字符对应的位置被计入损失以免干扰模型训练，因此需要loss_mask来屏蔽PAD位置的损失。
+
+3. **SFTDataset**  
+   *  ```
+      {
+         "conversations": [
+            {"role": "user", "content": "1+1=?"},
+            {"role": "assistant", "content": "2"}
+         ]
+      }
+      ```
+      SFT数据集的结构如上所示。
+
+      应用chat_template可以把这种格式的字典转化为纯文本。关键在于构建出loss_mask，使损失只关注assistant回答的部分。只需要确认bos_id和eos_id，在bos_id之后即为assistant说话的内容，在eos_id即为assistant说话的结束。在一段conversation文本中找出所有bos和eos之间的内容即可。
+
